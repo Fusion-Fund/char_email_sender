@@ -5,6 +5,7 @@ Reads a CSV (name, email), personalizes each email, and sends via Gmail SMTP.
 
 import base64
 import html
+import re
 import smtplib
 import time
 from email.mime.text import MIMEText
@@ -64,6 +65,41 @@ def personalize_text(text: str, receiver: str, sender: str) -> str:
     return text.replace("[RECEIVER]", receiver).replace("[NAME]", receiver).replace("[SENDER]", sender)
 
 
+def _text_to_html(text: str) -> str:
+    """Convert body text with markdown-like bullets and links to HTML."""
+    # Escape HTML first so user content is safe
+    text = html.escape(text)
+
+    # Convert [text](url) to links (url and text already escaped)
+    text = re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        lambda m: f'<a href="{m.group(2)}" style="color:#0066cc;text-decoration:underline;">{m.group(1)}</a>',
+        text,
+    )
+
+    # Convert bullet points: lines starting with - or * (must have space after)
+    lines = text.split("\n")
+    result = []
+    in_list = False
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("- ") or stripped.startswith("* "):
+            bullet_content = stripped[2:]
+            if not in_list:
+                result.append('<ul style="list-style-type:disc;margin-left:1.5em;padding-left:1em;">')
+                in_list = True
+            result.append(f"<li>{bullet_content}</li>")
+        else:
+            if in_list:
+                result.append("</ul>")
+                in_list = False
+            result.append(line + "<br>" if line else "<br>")
+    if in_list:
+        result.append("</ul>")
+
+    return "".join(result)
+
+
 def build_email_body(name: str, body: str, sender: str) -> str:
     """Build personalized email body."""
     personalized_body = personalize_text(body, name, sender)
@@ -81,41 +117,55 @@ def _image_subtype(fname: str) -> str:
     return "jpeg" if ext in ("jpg", "jpeg") else (ext if ext in ("png", "gif") else "png")
 
 
-def build_email_body_html(name: str, body: str, sender: str, image_list: list[tuple[str, bytes]]) -> str:
-    """Build HTML email body with [IMAGE] replaced by inline images. Returns HTML string."""
+def _build_html_email(name: str, html_body: str, sender: str) -> str:
+    """Wrap HTML body with greeting and sign-off."""
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head><body>
+<p>Dear {html.escape(name)},</p>
+<div>{html_body}</div>
+<p>Best regards,<br>{html.escape(sender)}</p>
+</body></html>"""
+
+
+def build_email_body_html(name: str, body: str, sender: str, image_list: list[tuple[str, bytes]], body_is_html: bool = False) -> str:
+    """Build HTML email body. If body_is_html, body is WYSIWYG HTML; else convert from markdown-like text."""
     personalized_body = personalize_text(body, name, sender)
     parts = personalized_body.split("[IMAGE]")
     if not image_list:
-        html_body = html.escape(parts[0] if parts else "").replace("\n", "<br>")
+        html_body = parts[0] if parts else ""
+        if not body_is_html:
+            html_body = _text_to_html(html_body)
     else:
         html_parts = []
         for i, part in enumerate(parts):
-            html_parts.append(html.escape(part).replace("\n", "<br>"))
+            html_parts.append(part if body_is_html else _text_to_html(part))
             if i < len(parts) - 1 and i < len(image_list):
                 html_parts.append(f'<img src="cid:img{i}" alt="image" style="max-width:100%;"/>')
         html_body = "".join(html_parts)
-    return f"""<p>Dear {name},</p>
-<p>{html_body}</p>
-<p>Best regards,<br>{html.escape(sender)}</p>"""
+    return _build_html_email(name, html_body, sender)
 
 
-def build_preview_html(name: str, body: str, sender: str, image_list: list[tuple[str, str]]) -> str:
+def build_preview_html(name: str, body: str, sender: str, image_list: list[tuple[str, str]], body_is_html: bool = False) -> str:
     """Build HTML for preview with data URLs. image_list is list of (filename, base64_data_url)."""
     personalized_body = personalize_text(body, name, sender)
     parts = personalized_body.split("[IMAGE]")
     if not image_list:
-        html_body = html.escape(parts[0] if parts else "").replace("\n", "<br>")
+        html_body = parts[0] if parts else ""
+        if not body_is_html:
+            html_body = _text_to_html(html_body)
     else:
         html_parts = []
         for i, part in enumerate(parts):
-            html_parts.append(html.escape(part).replace("\n", "<br>"))
+            html_parts.append(part if body_is_html else _text_to_html(part))
             if i < len(parts) - 1 and i < len(image_list):
                 _, data_url = image_list[i]
                 html_parts.append(f'<img src="{data_url}" alt="image" style="max-width:100%;"/>')
         html_body = "".join(html_parts)
-    return f"""<p>Dear {html.escape(name)},</p>
-<p>{html_body}</p>
-<p>Best regards,<br>{html.escape(sender)}</p>"""
+    return f"""<div style="font-family:sans-serif;">
+<p>Dear {html.escape(name)},</p>
+<div>{html_body}</div>
+<p>Best regards,<br>{html.escape(sender)}</p>
+</div>"""
 
 
 def send_email(
@@ -137,7 +187,7 @@ def send_email(
             msg["To"] = to_email
             if cc_email:
                 msg["Cc"] = cc_email
-            msg.attach(MIMEText(body, "html"))
+            msg.attach(MIMEText(body, "html", "utf-8"))
 
             for i, (fname, data) in enumerate(inline_images):
                 subtype = _image_subtype(fname)
@@ -158,7 +208,7 @@ def send_email(
             msg["To"] = to_email
             if cc_email:
                 msg["Cc"] = cc_email
-            msg.attach(MIMEText(body, "plain"))
+            msg.attach(MIMEText(body, "html", "utf-8"))
 
             if attachments:
                 for fname, data in attachments:
@@ -208,7 +258,27 @@ if uploaded_file:
 st.header("2. Compose email")
 subject = st.text_input("Subject", placeholder="Use [RECEIVER] and [SENDER] for personalization.")
 cc_email = st.text_input("CC", placeholder="cc@example.com", help="This address will be CC'd on every email sent.")
-body = st.text_area("Email body", placeholder="Use [RECEIVER], [SENDER], and [IMAGE] to embed images inline.", height=150)
+with st.expander("📝 Formatting (bullets, links)"):
+    st.markdown("**Bullets:** Start a line with `- ` or `* ` (space required). **Links:** `[text](https://url.com)`")
+col_edit, col_preview = st.columns(2)
+with col_edit:
+    body = st.text_area(
+        "Email body",
+        placeholder="Use [RECEIVER], [SENDER], [IMAGE]. Bullets: - item. Links: [text](url)",
+        height=200,
+        key="email_body",
+    )
+with col_preview:
+    st.caption("Live preview")
+    if body and sender_name:
+        preview_name = "Recipient"
+        if df is not None:
+            name_col = [c for c in df.columns if c.strip().lower() == "name"][0]
+            preview_name = str(df.iloc[0][name_col])
+        preview_html = build_preview_html(preview_name, body, sender_name, [], body_is_html=False)
+        st.components.v1.html(preview_html, height=200, scrolling=True)
+    else:
+        st.info("Enter body + sender name to see preview.")
 image_files = st.file_uploader("Drag and drop images to embed in body", type=["png", "jpg", "jpeg", "gif"], accept_multiple_files=True, help="Use [IMAGE] in the body where you want each image. Images are placed in order.")
 
 if df is not None and subject and body and sender_name:
@@ -232,11 +302,10 @@ if df is not None and subject and body and sender_name:
                 subtype = "jpeg" if ext in ("jpg", "jpeg") else ext
                 b64 = base64.b64encode(data).decode()
                 preview_image_list.append((f.name, f"data:image/{subtype};base64,{b64}"))
-            preview_html = build_preview_html(first_name, body, sender_name, preview_image_list)
-            st.markdown(preview_html, unsafe_allow_html=True)
+            preview_html = build_preview_html(first_name, body, sender_name, preview_image_list, body_is_html=False)
         else:
-            sample_body = build_email_body(first_name, body, sender_name)
-            st.text(sample_body)
+            preview_html = build_preview_html(first_name, body, sender_name, [], body_is_html=False)
+        st.components.v1.html(preview_html, height=250, scrolling=True)
 
 st.header("3. Send emails")
 if st.button("Send All Emails", type="primary"):
@@ -275,7 +344,7 @@ if st.button("Send All Emails", type="primary"):
                     name = str(row.get(name_col, "")).strip() or "there"
                     subject_text = personalize_text(subject, name, sender_name)
                     if use_inline:
-                        body_text = build_email_body_html(name, body, sender_name, inline_list)
+                        body_text = build_email_body_html(name, body, sender_name, inline_list, body_is_html=False)
                         err = send_email(
                             gmail_address,
                             gmail_app_password,
@@ -286,7 +355,7 @@ if st.button("Send All Emails", type="primary"):
                             inline_images=inline_list,
                         )
                     else:
-                        body_text = build_email_body(name, body, sender_name)
+                        body_text = build_email_body_html(name, body, sender_name, [], body_is_html=False)
                         err = send_email(
                             gmail_address,
                             gmail_app_password,
